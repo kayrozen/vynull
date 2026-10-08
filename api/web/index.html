@@ -2624,6 +2624,13 @@
     color: var(--orange);
     border-color: var(--orange);
   }
+  .detail-wave .player-controls .active {
+    color: var(--orange);
+    border-color: var(--orange);
+  }
+  .detail-wave .player-controls .pl-pads { display: inline-flex; flex-wrap: wrap; gap: 4px; margin-left: 6px; }
+  .detail-wave .player-controls .pl-pads button { font-size: 11px; padding: 2px 7px; }
+  .detail-wave .player-controls .pl-info { color: var(--text3); font-variant-numeric: tabular-nums; text-transform: none; letter-spacing: 0; }
   .detail-wave .beat-jump {
     display: flex; align-items: center; justify-content: center;
     flex-wrap: wrap; gap: 4px;
@@ -4883,6 +4890,7 @@ function detailZoomStep(delta) {
 }
 function detailZoomCenterTo(ms) {
   detailWave.centerMs = Math.max(0, Math.min(detailWave.durationMs, ms));
+  detailPlayerOnUserMove(detailWave.centerMs);
   redrawDetailWaveform();
 }
 // detailJumpBeats moves the cursor by `delta` beats (±1/2/4/8/16/32). With a
@@ -4912,6 +4920,319 @@ function detailJumpBeats(delta) {
     detailZoomCenterTo(detailWave.centerMs + delta * (60000 / detailWave.bpm));
   }
 }
+
+// ───────── DETAIL-DRAWER AUDIO PLAYER ─────────
+// Plays the open track through /api/audio/{id} so cues, loops and the beat
+// grid can be checked by ear without a CDJ. The zoom cursor (detailWave.centerMs)
+// is the playhead: while playing, the audio clock drives it; while paused,
+// panning/jumping just moves it and PLAY starts from there. Moving the cursor
+// during playback seeks the audio.
+const detailPlayer = {
+  audio:     null,   // HTMLAudioElement for detailPlayer.trackID
+  trackID:   null,
+  transcode: false,  // force the ffmpeg WAV path (same decoder as the analysis)
+  source:    '',     // 'direct' | 'transcoded', from X-Audio-Source
+  metro:     false,
+  loop:      null,   // {start,end} in ms while a saved loop is active
+  raf:       0,
+  driving:   false,  // true while the player itself moves centerMs
+  actx:      null,   // AudioContext for the metronome clicks
+  lastBeat:  -1,     // index of the last beat already scheduled
+  lastDraw:  0,
+  padsKey:   '',
+};
+const PLAYER_LOOKAHEAD_MS = 150;
+const PLAYER_DRAW_MS = 33;
+
+function detailPlayerActive() {
+  return !!(detailPlayer.audio && !detailPlayer.audio.paused);
+}
+function detailPlayerEl(id) { return document.getElementById(id); }
+
+// Create (or reuse) the audio element for the open track.
+function detailPlayerEnsure() {
+  const id = detailWave.trackID;
+  if (!id) return null;
+  if (detailPlayer.audio && detailPlayer.trackID === id) return detailPlayer.audio;
+  detailPlayerStop(true);
+  const a = new Audio();
+  a.preload = 'auto';
+  a.addEventListener('error', () => { toast('AUDIO LOAD FAILED', 'error'); detailPlayerSyncUI(); });
+  a.addEventListener('ended', () => { detailPlayerStopLoop(); detailPlayerSyncUI(); });
+  a.addEventListener('loadedmetadata', detailPlayerSyncUI);
+  detailPlayer.audio = a;
+  detailPlayer.trackID = id;
+  detailPlayerSetSrc(0);
+  return a;
+}
+function detailPlayerSetSrc(startMs) {
+  const a = detailPlayer.audio, id = detailPlayer.trackID;
+  const url = '/api/audio/' + id + (detailPlayer.transcode ? '?transcode=1' : '');
+  a.src = url;
+  a.addEventListener('loadedmetadata', function once() {
+    a.removeEventListener('loadedmetadata', once);
+    a.currentTime = Math.max(0, startMs) / 1000;
+  });
+  fetch(url, { method: 'HEAD' }).then(r => {
+    detailPlayer.source = r.headers.get('X-Audio-Source') || '';
+    detailPlayerSyncUI();
+  }).catch(() => {});
+}
+
+// Release the audio element and any clicks. keepUI=true skips the repaint
+// (used when switching tracks inside detailPlayerEnsure).
+function detailPlayerStop(keepUI) {
+  cancelAnimationFrame(detailPlayer.raf);
+  detailPlayer.raf = 0;
+  if (detailPlayer.audio) {
+    detailPlayer.audio.pause();
+    detailPlayer.audio.removeAttribute('src');
+    detailPlayer.audio.load();
+  }
+  detailPlayer.audio = null;
+  detailPlayer.trackID = null;
+  detailPlayer.loop = null;
+  detailPlayer.source = '';
+  detailPlayer.lastBeat = -1;
+  if (!keepUI) detailPlayerSyncUI();
+}
+function detailPlayerStopLoop() { detailPlayer.loop = null; }
+
+function detailPlayerPlay() {
+  const a = detailPlayerEnsure();
+  if (!a) return;
+  if (detailPlayer.metro) detailPlayerMetroInit();
+  const ms = Math.max(0, Math.min(detailWave.durationMs, detailWave.centerMs));
+  if (a.readyState >= 1) a.currentTime = ms / 1000;
+  else a.addEventListener('loadedmetadata', function once() {
+    a.removeEventListener('loadedmetadata', once);
+    a.currentTime = ms / 1000;
+  });
+  detailPlayer.lastBeat = -1;
+  a.play().then(() => {
+    detailPlayerSyncUI();
+    if (!detailPlayer.raf) detailPlayer.raf = requestAnimationFrame(detailPlayerTick);
+  }).catch(() => toast('PLAYBACK BLOCKED', 'error'));
+}
+function detailPlayerPause() {
+  const a = detailPlayer.audio;
+  if (!a) return;
+  a.pause();
+  cancelAnimationFrame(detailPlayer.raf);
+  detailPlayer.raf = 0;
+  detailPlayerSyncUI();
+}
+function detailPlayerToggle() {
+  if (detailPlayerActive()) detailPlayerPause(); else detailPlayerPlay();
+}
+
+// Called from detailZoomCenterTo for every user-driven cursor move.
+function detailPlayerOnUserMove(ms) {
+  const a = detailPlayer.audio;
+  if (!a || detailPlayer.driving || detailPlayer.trackID !== detailWave.trackID) return;
+  if (a.readyState >= 1) a.currentTime = Math.max(0, ms) / 1000;
+  detailPlayer.lastBeat = -1;
+  // Moving outside the active loop leaves it, as on a CDJ.
+  const lp = detailPlayer.loop;
+  if (lp && (ms < lp.start || ms >= lp.end)) detailPlayer.loop = null;
+}
+
+function detailPlayerTick() {
+  detailPlayer.raf = 0;
+  const a = detailPlayer.audio;
+  if (!a || a.paused || detailPlayer.trackID !== detailWave.trackID) return;
+  let ms = a.currentTime * 1000;
+  const lp = detailPlayer.loop;
+  if (lp && ms >= lp.end) {
+    a.currentTime = lp.start / 1000;
+    ms = lp.start;
+    detailPlayer.lastBeat = -1;
+  }
+  if (detailPlayer.metro) detailPlayerScheduleClicks(ms);
+  const now = performance.now();
+  if (now - detailPlayer.lastDraw >= PLAYER_DRAW_MS) {
+    detailPlayer.lastDraw = now;
+    detailPlayer.driving = true;
+    detailWave.centerMs = ms;
+    redrawDetailWaveform();
+    detailPlayer.driving = false;
+    detailPlayerSyncInfo();
+  }
+  detailPlayer.raf = requestAnimationFrame(detailPlayerTick);
+}
+
+// Metronome: a short click per beat of the analysed grid (higher pitch on the
+// downbeat), scheduled slightly ahead on the Web Audio clock. If the clicks
+// land off the audible beats, the grid (or the decoder alignment, see the WAV
+// toggle) is off.
+function detailPlayerMetroInit() {
+  if (!detailPlayer.actx) detailPlayer.actx = new (window.AudioContext || window.webkitAudioContext)();
+  if (detailPlayer.actx.state === 'suspended') detailPlayer.actx.resume();
+}
+function detailPlayerScheduleClicks(posMs) {
+  const beats = detailWave.beats, ctx = detailPlayer.actx;
+  if (!beats || !beats.length || !ctx) return;
+  let i = detailPlayer.lastBeat + 1;
+  if (detailPlayer.lastBeat < 0) {
+    // First beat at or after the playhead (binary search).
+    let lo = 0, hi = beats.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (beats[mid].time_ms < posMs) lo = mid + 1; else hi = mid;
+    }
+    i = lo;
+  }
+  const loopEnd = detailPlayer.loop ? detailPlayer.loop.end : Infinity;
+  for (; i < beats.length; i++) {
+    const dt = beats[i].time_ms - posMs;
+    if (dt > PLAYER_LOOKAHEAD_MS || beats[i].time_ms >= loopEnd) break;
+    detailPlayerClick(ctx.currentTime + Math.max(0, dt) / 1000, beats[i].beat_in_bar === 1);
+    detailPlayer.lastBeat = i;
+  }
+}
+function detailPlayerClick(when, accent) {
+  const ctx = detailPlayer.actx;
+  const osc = ctx.createOscillator(), g = ctx.createGain();
+  osc.frequency.value = accent ? 1760 : 1100;
+  g.gain.setValueAtTime(0.0001, when);
+  g.gain.exponentialRampToValueAtTime(0.5, when + 0.002);
+  g.gain.exponentialRampToValueAtTime(0.0001, when + 0.05);
+  osc.connect(g).connect(ctx.destination);
+  osc.start(when);
+  osc.stop(when + 0.06);
+}
+
+// Jump to a cue: seeks and starts playing from it (like pressing a hot-cue
+// pad). A saved loop also becomes the active loop.
+function detailPlayerJumpToCue(cue) {
+  if (!cue) return;
+  const ms = cue.time_ms;
+  const loop = (cue.type === 'loop' && cue.loop_ms > ms) ? { start: ms, end: cue.loop_ms } : null;
+  const wasPlaying = detailPlayerActive();
+  detailZoomCenterTo(ms);            // seeks via detailPlayerOnUserMove
+  detailPlayer.loop = loop;
+  if (!wasPlaying) detailPlayerPlay();
+  detailPlayerSyncUI();
+}
+function detailPlayerSortedCues() {
+  return (detailWave.cues || []).slice().sort((a, b) => a.time_ms - b.time_ms);
+}
+// Previous / next cue (hot or memory) relative to the playhead.
+function detailPlayerStepCue(dir) {
+  const cues = detailPlayerSortedCues();
+  const ms = detailWave.centerMs;
+  const eps = 50;
+  const c = dir > 0 ? cues.find(c => c.time_ms > ms + eps)
+                    : cues.slice().reverse().find(c => c.time_ms < ms - eps);
+  if (c) { detailZoomCenterTo(c.time_ms); }
+}
+function detailPlayerToggleMetro() {
+  detailPlayer.metro = !detailPlayer.metro;
+  if (detailPlayer.metro) { detailPlayerMetroInit(); detailPlayer.lastBeat = -1; }
+  detailPlayerSyncUI();
+}
+function detailPlayerToggleTranscode() {
+  detailPlayer.transcode = !detailPlayer.transcode;
+  const a = detailPlayer.audio;
+  if (a) {
+    const wasPlaying = !a.paused, pos = a.currentTime * 1000;
+    a.pause();
+    detailPlayerSetSrc(pos);
+    if (wasPlaying) {
+      a.addEventListener('loadedmetadata', function once() {
+        a.removeEventListener('loadedmetadata', once);
+        a.play().catch(() => {});
+        if (!detailPlayer.raf) detailPlayer.raf = requestAnimationFrame(detailPlayerTick);
+      });
+    }
+  }
+  detailPlayerSyncUI();
+}
+
+// ── controls UI ──
+function detailPlayerSyncInfo() {
+  const el = detailPlayerEl('pl-info');
+  if (!el) return;
+  const a = detailPlayer.audio;
+  let txt = detailPlayer.source ? detailPlayer.source.toUpperCase() : '';
+  if (a && isFinite(a.duration) && detailWave.durationMs) {
+    // Browser length vs the analysed length: a big gap means the playhead
+    // won't line up with the grid and cue times.
+    const d = a.duration * 1000 - detailWave.durationMs;
+    txt += ' · Δlen ' + (d >= 0 ? '+' : '') + Math.round(d) + 'ms';
+  }
+  if (detailPlayer.loop) txt += ' · LOOP ' + fmtCueTime(detailPlayer.loop.start) + '–' + fmtCueTime(detailPlayer.loop.end);
+  el.textContent = txt;
+}
+function detailPlayerSyncUI() {
+  const play = detailPlayerEl('pl-play');
+  if (!play) return;
+  const on = detailPlayerActive();
+  play.textContent = on ? '❚❚ PAUSE' : '▶ PLAY';
+  play.classList.toggle('active', on);
+  detailPlayerEl('pl-metro').classList.toggle('active', detailPlayer.metro);
+  detailPlayerEl('pl-wav').classList.toggle('active', detailPlayer.transcode);
+  detailPlayerSyncInfo();
+  detailPlayerRenderPads(true);
+}
+// One pad per cue (hot cues A–H by number, memory cues as M1…); rebuilt only
+// when the cue list changes.
+function detailPlayerRenderPads(force) {
+  const box = detailPlayerEl('pl-pads');
+  if (!box) return;
+  const cues = detailPlayerSortedCues();
+  const lp = detailPlayer.loop;
+  const key = cues.map(c => [c.number, c.type, c.time_ms, c.loop_ms].join(':')).join('|') + '|' + (lp ? lp.start : '');
+  if (!force && key === detailPlayer.padsKey && box.childElementCount) return;
+  detailPlayer.padsKey = key;
+  box.textContent = '';
+  for (const c of cues) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    const hot = c.number >= 1 && c.number <= 8;
+    b.textContent = hot ? String.fromCharCode(64 + c.number) : 'M';
+    b.title = (hot ? 'Hot cue ' + b.textContent : 'Memory cue') + ' · ' + fmtCueTimeMs(c.time_ms) +
+              (c.type === 'loop' ? ' · loop' : '') + (hot ? ' · key ' + c.number : '');
+    if (c.type === 'loop') b.textContent += '⟲';
+    if (lp && lp.start === c.time_ms) b.classList.add('active');
+    b.addEventListener('click', () => { b.blur(); detailPlayerJumpToCue(c); });
+    box.appendChild(b);
+  }
+}
+// Called from renderDetail once the drawer DOM exists.
+function detailPlayerBind(t) {
+  if (detailPlayer.trackID && detailPlayer.trackID !== t.id) detailPlayerStop(true);
+  const on = (id, fn) => detailPlayerEl(id).addEventListener('click', e => { e.currentTarget.blur(); fn(); });
+  on('pl-play', detailPlayerToggle);
+  on('pl-metro', detailPlayerToggleMetro);
+  on('pl-wav', detailPlayerToggleTranscode);
+  detailPlayer.padsKey = '';
+  detailPlayerSyncUI();
+}
+
+// Keyboard (drawer open, not typing): space play/pause · 1–8 hot cues ·
+// [ ] previous/next cue · ←/→ one beat · M metronome · L leave loop.
+document.addEventListener('keydown', e => {
+  if (selectedTrackID == null || detailWave.trackID !== selectedTrackID) return;
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  const tg = e.target;
+  if (tg && (tg.tagName === 'INPUT' || tg.tagName === 'TEXTAREA' || tg.tagName === 'SELECT' || tg.isContentEditable)) return;
+  if (!detailPlayerEl('pl-play')) return;
+  let handled = true;
+  if (e.key === ' ') detailPlayerToggle();
+  else if (e.key >= '1' && e.key <= '8') {
+    const c = (detailWave.cues || []).find(c => c.number === parseInt(e.key, 10));
+    if (c) detailPlayerJumpToCue(c); else handled = false;
+  }
+  else if (e.key === '[') detailPlayerStepCue(-1);
+  else if (e.key === ']') detailPlayerStepCue(+1);
+  else if (e.key === 'ArrowLeft')  detailJumpBeats(e.shiftKey ? -4 : -1);
+  else if (e.key === 'ArrowRight') detailJumpBeats(e.shiftKey ? 4 : 1);
+  else if (e.key === 'm' || e.key === 'M') detailPlayerToggleMetro();
+  else if (e.key === 'l' || e.key === 'L') { detailPlayer.loop = null; detailPlayerSyncUI(); }
+  else handled = false;
+  if (handled) e.preventDefault();
+});
 
 // Locate a cue marker within `tolMs` of `ms`. When multiple cues match
 // (e.g., overlapping at small zoom levels), the closest one wins.
@@ -7637,6 +7958,7 @@ async function openDetail(trackID) {
 }
 
 function closeDetail() {
+  detailPlayerStop();
   selectedTrackID = null;
   document.querySelectorAll('tr[data-track-row].selected').forEach(r => r.classList.remove('selected'));
   document.getElementById('detail-drawer').classList.remove('open');
@@ -7832,6 +8154,14 @@ function renderDetail(t, cues, wave, phrases, analysis) {
     <div class="detail-wave">
       <canvas id="detail-overview" class="overview"></canvas>
       <div id="detail-phrases"></div>
+      <div class="zoom-controls player-controls" style="justify-content:flex-start">
+        <button type="button" id="pl-play" title="Play / pause from the cursor (Space)">▶ PLAY</button>
+        <button type="button" id="pl-metro" title="Click on every beat of the analysed grid (M)">METRO</button>
+        <button type="button" id="pl-wav" title="Play the ffmpeg-decoded WAV, the same decoder the analysis used, to rule out browser decoder offset">WAV</button>
+        <span id="pl-pads" class="pl-pads" title="Click or press 1–8 to jump to a cue · [ ] previous/next cue"></span>
+        <span style="flex:1"></span>
+        <span id="pl-info" class="pl-info"></span>
+      </div>
       <div class="zoom-controls">
         <button type="button" id="add-cue-at-cursor" title="Add a hot cue at the cursor position">+ CUE</button>
         <button type="button" id="add-memcue-at-cursor" title="Add a memory cue at the cursor position">+ MEM</button>
@@ -7915,6 +8245,7 @@ function renderDetail(t, cues, wave, phrases, analysis) {
   // ran further below. (The overview strip is rendered directly, hence it was
   // already correct on first open.)
   detailPhrasesCache = Array.isArray(phrases) ? phrases : [];
+  detailPlayerBind(t);
 
   // Draw the rekordbox-style overview + zoom waveforms now that the
   // canvases are in the DOM. setDetailWaveform populates the shared
