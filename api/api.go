@@ -315,6 +315,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/link", s.handleLink)
 
 	// Analysis endpoints
+	mux.HandleFunc("/api/audio/", s.handleAudio)
 	mux.HandleFunc("/api/analysis/", s.handleAnalysis)
 	mux.HandleFunc("/api/analysis/ext/", s.handleExtAnalysis)
 	mux.HandleFunc("/api/analysis/reanalyze/", s.handleReanalyze)
